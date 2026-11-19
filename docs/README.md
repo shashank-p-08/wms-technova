@@ -1,7 +1,8 @@
 # TechNova WMS — Cloud Foundation
 
 The full write-up, with concepts, design decisions and test results, is in
-[TechNova-WMS-Cloud-Foundation.docx](TechNova-WMS-Cloud-Foundation.docx). This page is the quick reference.
+[TechNova-WMS-Cloud-Foundation-v3.docx](TechNova-WMS-Cloud-Foundation-v3.docx); a two-page overview for the team is in
+[TechNova-WMS-Change-Summary.docx](TechNova-WMS-Change-Summary.docx). This page is the quick reference.
 
 ## What is implemented
 
@@ -66,6 +67,26 @@ How it works:
 | Resilience | Graceful shutdown (drains on SIGTERM), container health checks, React error boundaries | `main.ts`, Dockerfiles, `ErrorBoundary.tsx` |
 | Packaging | Multi-stage images (API runs as non-root `node`; web is static nginx with long-lived asset caching); `docker compose up --build` runs the full stack | `server/Dockerfile`, `client/Dockerfile`, `docker-compose.yml` |
 | CI | Web lint and build; API build, migrations on an empty Postgres, drift check, production-mode start, 54-check end-to-end suite; cfn-lint and terraform validate; image builds | `.github/workflows/ci.yml`, `server/test/e2e/api_e2e.py` |
+
+## Hosting on AWS (ECS Fargate)
+
+`infrastructure/cloudformation/app-hosting.yaml` builds on the foundation stack: one Application Load Balancer (`/api/*` → API, everything else → web), two Fargate services, ECR registries (immutable tags, scan on push), CPU auto scaling for the API, automatic rollback of unhealthy deployments, and a generated first-admin password in Secrets Manager. Prod runs tasks in private subnets behind a NAT gateway; dev and staging use public subnets (no NAT cost) and the load balancer remains the only way in.
+
+```powershell
+./scripts/deploy-infra.ps1 -Environment dev          # foundation, once
+./scripts/deploy-app.ps1   -Environment dev          # build, push (tag = git commit), deploy
+./scripts/deploy-app.ps1   -Environment prod -CertificateArn arn:aws:acm:...   # HTTPS
+```
+
+Add `-Local` to target Floci. Floci can't resolve its own ECR hostname from Docker Desktop and gives tasks no task-role credentials, so `-Local` pushes to Floci's registry container and sets the emulator-only `EmulatorEndpoint` parameter. Leave that parameter empty on AWS.
+
+## Local development against the RDS database
+
+```powershell
+./scripts/floci-rds-tunnel.ps1 start     # localhost:7001 -> Floci RDS (stop / status too)
+```
+
+`CloudWMS/server/.env` uses `DB_SECRET_ARN` plus `DB_HOST=localhost`, `DB_PORT=7001`, with TLS verified against the Floci CA (`certs/floci-root-ca.crt`). Local PostgreSQL settings remain there, commented out, as a fallback.
 
 ## Point the app at AWS
 
