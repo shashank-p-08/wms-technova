@@ -35,7 +35,13 @@ function Invoke-Native {
     param([scriptblock]$Command, [string]$What)
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    try { & $Command 2>&1 | ForEach-Object { "$_" } }
+    try {
+        & $Command 2>&1 | ForEach-Object {
+            # stderr lines arrive as ErrorRecords; print their text, skip empty ones
+            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+            if ($line.Trim()) { $line }
+        }
+    }
     finally { $ErrorActionPreference = $previous }
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
 }
