@@ -1,0 +1,78 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DiscoverProjectResources",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "resource-groups:Get*",
+        "resource-groups:List*",
+        "resource-groups:SearchResources",
+        "tag:GetResources",
+        "cloudformation:Describe*",
+        "cloudformation:List*",
+        "budgets:ViewBudget",
+        "ec2:DescribeRegions",
+        "ec2:DescribeAvailabilityZones"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ListNonProdAssetBuckets",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": [
+        "arn:aws:s3:::technova-wms-dev-assets-*",
+        "arn:aws:s3:::technova-wms-staging-assets-*"
+      ]
+    },
+    {
+      "Sid": "ReadWriteNonProdAssetObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": [
+        "arn:aws:s3:::technova-wms-dev-assets-*/*",
+        "arn:aws:s3:::technova-wms-staging-assets-*/*"
+      ]
+    },
+    {
+      "Sid": "ReadOnlyProdAssets",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::technova-wms-prod-assets-*",
+        "arn:aws:s3:::technova-wms-prod-assets-*/*"
+      ]
+    },
+    {
+      "Sid": "NeverDeleteOrReopenBuckets",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteBucket",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:PutBucketPublicAccessBlock"
+      ],
+      "Resource": "arn:aws:s3:::technova-wms-*"
+    },
+    {
+      "Sid": "DenyEverythingWithoutMFA",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:ChangePassword",
+        "iam:GetUser",
+        "iam:ListMFADevices",
+        "iam:ListVirtualMFADevices",
+        "iam:CreateVirtualMFADevice",
+        "iam:EnableMFADevice",
+        "iam:ResyncMFADevice",
+        "sts:GetSessionToken"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" }
+      }
+    }
+  ]
+}

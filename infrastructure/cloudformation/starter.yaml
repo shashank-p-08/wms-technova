@@ -1,0 +1,572 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  TechNova Cloud WMS - environment foundation stack.
+  Implements the cloud-fundamentals baseline for ONE environment in ONE account:
+  region guard, mandatory tagging, IAM (least-privilege app role + developer and
+  auditor groups), a tag-based Resource Group, the S3 assets bucket, a private
+  VPC with an encrypted RDS PostgreSQL database (credentials in Secrets Manager),
+  and a monthly cost budget. Deploy once per environment (dev / staging / prod).
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: technova-wms
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+    Description: Lower-case project slug. Used in resource names and the Project tag.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment. In production each environment lives in its own AWS account.
+
+  Owner:
+    Type: String
+    Default: platform-team
+    Description: Team accountable for these resources (Owner tag).
+
+  CostCenter:
+    Type: String
+    Default: CC-1001
+    Description: Finance cost centre for chargeback (CostCenter tag).
+
+  BudgetAlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address that receives budget alerts. Leave blank to skip notifications.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedPattern: '^db\.[a-z0-9]+\.[a-z0-9]+$'
+    Description: RDS instance size. db.t4g.micro is Free-Tier eligible.
+
+  DbEngineVersion:
+    Type: String
+    Default: '17'
+    Description: PostgreSQL major version (RDS picks the latest minor).
+
+# ---------------------------------------------------------------------------
+# Region guard - the stack refuses to deploy outside the approved regions.
+#   us-east-1 = primary region, us-west-2 = disaster-recovery region.
+# The organisation-wide equivalent is iam/policies/region-restriction-scp.json.
+# ---------------------------------------------------------------------------
+Rules:
+  ApprovedRegionsOnly:
+    Assertions:
+      - Assert: !Contains [[us-east-1, us-west-2], !Ref 'AWS::Region']
+        AssertDescription: TechNova WMS may only be deployed to us-east-1 (primary) or us-west-2 (DR).
+
+# ---------------------------------------------------------------------------
+# Per-environment settings
+# ---------------------------------------------------------------------------
+Mappings:
+  EnvironmentConfig:
+    dev:
+      MonthlyBudgetUsd: 50
+      NoncurrentVersionDays: 7
+      VpcCidr: 10.20.0.0/16
+      PrivateSubnetACidr: 10.20.1.0/24
+      PrivateSubnetBCidr: 10.20.2.0/24
+      DbStorageGb: 20
+      DbBackupDays: 1
+      DbMultiAz: 'false'
+    staging:
+      MonthlyBudgetUsd: 100
+      NoncurrentVersionDays: 30
+      VpcCidr: 10.30.0.0/16
+      PrivateSubnetACidr: 10.30.1.0/24
+      PrivateSubnetBCidr: 10.30.2.0/24
+      DbStorageGb: 20
+      DbBackupDays: 7
+      DbMultiAz: 'false'
+    prod:
+      MonthlyBudgetUsd: 500
+      NoncurrentVersionDays: 90
+      VpcCidr: 10.40.0.0/16
+      PrivateSubnetACidr: 10.40.1.0/24
+      PrivateSubnetBCidr: 10.40.2.0/24
+      DbStorageGb: 50
+      DbBackupDays: 14
+      DbMultiAz: 'true'
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  # IAM and Budgets are GLOBAL (account-wide), not regional. Account-wide resources are
+  # created only by the primary-region stack so a DR-region deployment does not collide.
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', us-east-1]
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, '']]
+  IsMultiAz: !Equals [!FindInMap [EnvironmentConfig, !Ref Environment, DbMultiAz], 'true']
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ---- Storage --------------------------------------------------------------
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Account + region suffix keeps the globally-unique name collision-free
+      BucketName: !Sub '${ProjectName}-${Environment}-assets-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !FindInMap [EnvironmentConfig, !Ref Environment, NoncurrentVersionDays]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AssetsBucket.Arn
+              - !Sub '${AssetsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---- Network: private VPC across two availability zones ---------------------
+  # No internet gateway: the database is never reachable from the internet. The API
+  # runs inside this VPC (ECS/EC2 in AppSecurityGroup) to reach it.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [EnvironmentConfig, !Ref Environment, VpcCidr]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-vpc' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [EnvironmentConfig, !Ref Environment, PrivateSubnetACidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-a' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [EnvironmentConfig, !Ref Environment, PrivateSubnetBCidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-b' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudWMS API compute - attach to the ECS service or EC2 instance
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-app-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudWMS PostgreSQL - accepts connections only from the API security group
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: PostgreSQL from CloudWMS API
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  # ---- Database: RDS PostgreSQL, credentials generated into Secrets Manager -----
+  # The database lives in the primary region; DR relies on automated backups
+  # (cross-region backup replication can be enabled later).
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: IsPrimaryRegion
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName} ${Environment} private subnets'
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: !Sub '${ProjectName}/${Environment}/db-master'
+      Description: CloudWMS PostgreSQL credentials. The attachment below adds host, port and dbname.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "wmsadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        # Characters RDS rejects in master passwords, plus quotes/backslash/space
+        ExcludeCharacters: "\"@/\\ '"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Condition: IsPrimaryRegion
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-db'
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      DBName: technova_wms
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      AllocatedStorage: !FindInMap [EnvironmentConfig, !Ref Environment, DbStorageGb]
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !If [IsMultiAz, true, false]
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      BackupRetentionPeriod: !FindInMap [EnvironmentConfig, !Ref Environment, DbBackupDays]
+      DeletionProtection: !If [IsProd, true, false]
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Condition: IsPrimaryRegion
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  # ---- Auth: JWT signing key, generated and never seen by a human -------------
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${Environment}/jwt-signing-key'
+      Description: HS256 signing key for CloudWMS access tokens (set JWT_SECRET_ARN to this ARN)
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  # ---- IAM: application runtime identity (least privilege) --------------------
+  AppRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-app-role-${AWS::Region}'
+      Description: Runtime identity for the CloudWMS NestJS API (ECS task or EC2 instance).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  AppRuntimePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-app-policy-${AWS::Region}'
+      Description: Object read/write on this environment's assets bucket only. Mirrors iam/policies/wms-app-policy.json.
+      Roles: [!Ref AppRuntimeRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ListAssetsBucket
+            Effect: Allow
+            Action: [s3:ListBucket, s3:GetBucketLocation]
+            Resource: !GetAtt AssetsBucket.Arn
+          - Sid: ReadWriteAssetObjects
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+            Resource: !Sub '${AssetsBucket.Arn}/*'
+          - !If
+            - IsPrimaryRegion
+            - Sid: ReadDatabaseCredentials
+              Effect: Allow
+              Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+              Resource: !Ref DbSecret
+            - !Ref 'AWS::NoValue'
+          - Sid: ReadJwtSigningKey
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref JwtSecret
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-${Environment}-app-profile-${AWS::Region}'
+      Roles: [!Ref AppRuntimeRole]
+
+  # ---- IAM: human access via groups (never attach policies to users) ----------
+  DevelopersGroup:
+    Type: AWS::IAM::Group
+    Condition: IsPrimaryRegion
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-developers'
+      Policies:
+        - PolicyName: developer-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DiscoverProjectResources
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - resource-groups:Get*
+                  - resource-groups:List*
+                  - resource-groups:SearchResources
+                  - tag:GetResources
+                  - cloudformation:Describe*
+                  - cloudformation:List*
+                  - budgets:ViewBudget
+                  - rds:DescribeDBInstances
+                  - secretsmanager:ListSecrets
+                Resource: '*'
+              - Sid: ListAssetsBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt AssetsBucket.Arn
+              - Sid: ReadAssetObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${AssetsBucket.Arn}/*'
+              # Developers may write data in dev/staging; prod is read-only for humans.
+              - !If
+                - IsProd
+                - !Ref 'AWS::NoValue'
+                - Sid: WriteAssetObjectsNonProd
+                  Effect: Allow
+                  Action: [s3:PutObject, s3:DeleteObject]
+                  Resource: !Sub '${AssetsBucket.Arn}/*'
+              - Sid: NeverDeleteBucket
+                Effect: Deny
+                Action: [s3:DeleteBucket, s3:PutBucketPolicy, s3:DeleteBucketPolicy]
+                Resource: !GetAtt AssetsBucket.Arn
+              # Humans must sign in with MFA before anything else is allowed
+              - Sid: DenyEverythingWithoutMFA
+                Effect: Deny
+                NotAction:
+                  - iam:ChangePassword
+                  - iam:GetUser
+                  - iam:ListMFADevices
+                  - iam:ListVirtualMFADevices
+                  - iam:CreateVirtualMFADevice
+                  - iam:EnableMFADevice
+                  - iam:ResyncMFADevice
+                  - sts:GetSessionToken
+                Resource: '*'
+                Condition:
+                  BoolIfExists:
+                    aws:MultiFactorAuthPresent: 'false'
+
+  AuditorsGroup:
+    Type: AWS::IAM::Group
+    Condition: IsPrimaryRegion
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-auditors'
+      Policies:
+        - PolicyName: auditor-read-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOnlyGovernanceView
+                Effect: Allow
+                Action:
+                  - iam:Get*
+                  - iam:List*
+                  - iam:GenerateCredentialReport
+                  - s3:GetBucket*
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:ListAllMyBuckets
+                  - resource-groups:Get*
+                  - resource-groups:List*
+                  - resource-groups:SearchResources
+                  - tag:GetResources
+                  - cloudformation:Describe*
+                  - cloudformation:List*
+                  - budgets:ViewBudget
+                  - rds:Describe*
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:DescribeSecret
+                Resource: '*'
+
+  # ---- Resource Group: every resource tagged Project + Environment -------------
+  EnvironmentResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}'
+      Description: !Sub 'All ${ProjectName} resources in the ${Environment} environment - tag based'
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters: [AWS::AllSupported]
+          TagFilters:
+            - Key: Project
+              Values: [!Ref ProjectName]
+            - Key: Environment
+              Values: [!Ref Environment]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  # ---- Cost guard-rail: monthly budget per environment ------------------------
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: IsPrimaryRegion
+    Properties:
+      Budget:
+        BudgetName: !Sub '${ProjectName}-${Environment}-monthly'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !FindInMap [EnvironmentConfig, !Ref Environment, MonthlyBudgetUsd]
+          Unit: USD
+      NotificationsWithSubscribers: !If
+        - HasBudgetEmail
+        - - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 80
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - { SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }
+          - Notification:
+              NotificationType: FORECASTED
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - { SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }
+        - !Ref 'AWS::NoValue'
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  AssetsBucketName:
+    Description: Set as S3_BUCKET_NAME in CloudWMS/server/.env
+    Value: !Ref AssetsBucket
+  AppRuntimeRoleArn:
+    Description: Role the API runs as
+    Value: !GetAtt AppRuntimeRole.Arn
+  AppInstanceProfileName:
+    Value: !Ref AppInstanceProfile
+  DevelopersGroupName:
+    Condition: IsPrimaryRegion
+    Value: !Ref DevelopersGroup
+  AuditorsGroupName:
+    Condition: IsPrimaryRegion
+    Value: !Ref AuditorsGroup
+  ResourceGroupName:
+    Value: !Sub '${ProjectName}-${Environment}'
+  DeployedRegion:
+    Value: !Ref 'AWS::Region'
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  AppSecurityGroupId:
+    Description: Attach to the compute that runs the API so it can reach the database
+    Value: !Ref AppSecurityGroup
+  DbEndpointAddress:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt Database.Endpoint.Address
+  DbEndpointPort:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt Database.Endpoint.Port
+  DbSecretArn:
+    Condition: IsPrimaryRegion
+    Description: Set as DB_SECRET_ARN in CloudWMS/server/.env
+    Value: !Ref DbSecret
+  JwtSecretArn:
+    Description: Set as JWT_SECRET_ARN in CloudWMS/server/.env
+    Value: !Ref JwtSecret

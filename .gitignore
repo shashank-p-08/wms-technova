@@ -1,0 +1,27 @@
+# Secrets / credentials - never commit
+.env
+*.pem
+*.key
+.aws/
+credentials
+
+# Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Office lock files (a document open in Word/Excel)
+~$*

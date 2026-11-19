@@ -1,0 +1,60 @@
+# Full CloudWMS stack in production mode on one machine:
+#   docker compose up --build
+#   web  -> http://localhost:8080      api -> http://localhost:3000/api
+#
+# Uses its own PostgreSQL (schema created by migrations, like RDS) and the Floci
+# emulator already running on the host for S3 / Secrets Manager.
+name: cloudwms
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: technova_wms
+      POSTGRES_USER: wms
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:-local-dev-only-password}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wms -d technova_wms"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./server
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USERNAME: wms
+      DB_PASSWORD: ${LOCAL_DB_PASSWORD:-local-dev-only-password}
+      DB_NAME: technova_wms
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (32+ chars) in your shell or a .env next to this file}
+      CORS_ORIGINS: http://localhost:8080
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@technova.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Floci on the host
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://host.docker.internal:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-technova-wms-dev-assets-000000000000-us-east-1}
+    ports:
+      - "3000:3000"
+
+  web:
+    build:
+      context: ./client
+      args:
+        VITE_API_URL: http://localhost:3000/api
+    depends_on:
+      - api
+    ports:
+      - "8080:8080"
+
+volumes:
+  db-data:

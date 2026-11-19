@@ -1,0 +1,11 @@
+{
+  // Teach the YAML extension CloudFormation's short-form intrinsic functions,
+  // so starter.yaml stops showing false "Unresolved tag" errors.
+  "yaml.customTags": [
+    "!And sequence", "!Base64 scalar", "!Cidr sequence", "!Condition scalar",
+    "!Equals sequence", "!FindInMap sequence", "!GetAtt scalar", "!GetAtt sequence",
+    "!GetAZs scalar", "!If sequence", "!ImportValue scalar", "!Join sequence",
+    "!Not sequence", "!Or sequence", "!Ref scalar", "!Select sequence",
+    "!Split sequence", "!Sub scalar", "!Sub sequence", "!Contains sequence"
+  ]
+}
