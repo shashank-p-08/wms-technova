@@ -74,3 +74,6 @@ wms-test.txt
 
 # Local database backups
 backups/
+
+# Local TLS material (Floci CA; RDS bundle is downloaded by scripts/get-rds-ca.ps1)
+server/certs/
