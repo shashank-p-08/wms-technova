@@ -535,9 +535,13 @@ Outputs:
   AssetsBucketName:
     Description: Set as S3_BUCKET_NAME in CloudWMS/server/.env
     Value: !Ref AssetsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AssetsBucketName'
   AppRuntimeRoleArn:
     Description: Role the API runs as
     Value: !GetAtt AppRuntimeRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppRuntimeRoleArn'
   AppInstanceProfileName:
     Value: !Ref AppInstanceProfile
   DevelopersGroupName:
@@ -552,11 +556,23 @@ Outputs:
     Value: !Ref 'AWS::Region'
   VpcId:
     Value: !Ref Vpc
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
   PrivateSubnetIds:
     Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  PrivateSubnetAId:
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetAId'
+  PrivateSubnetBId:
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetBId'
   AppSecurityGroupId:
     Description: Attach to the compute that runs the API so it can reach the database
     Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSecurityGroupId'
   DbEndpointAddress:
     Condition: IsPrimaryRegion
     Value: !GetAtt Database.Endpoint.Address
@@ -567,6 +583,10 @@ Outputs:
     Condition: IsPrimaryRegion
     Description: Set as DB_SECRET_ARN in CloudWMS/server/.env
     Value: !Ref DbSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DbSecretArn'
   JwtSecretArn:
     Description: Set as JWT_SECRET_ARN in CloudWMS/server/.env
     Value: !Ref JwtSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-JwtSecretArn'

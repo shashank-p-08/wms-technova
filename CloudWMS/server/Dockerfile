@@ -26,6 +26,9 @@ COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node package.json ./
 COPY --chown=node:node scripts ./scripts
+# Amazon RDS CA bundle so the API can verify the database's TLS certificate
+# (DB_SSL=true, DB_SSL_CA_PATH=/app/certs/rds-global-bundle.pem)
+ADD --chown=node:node --chmod=444 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /app/certs/rds-global-bundle.pem
 USER node
 EXPOSE 3000
 # Container-level health check; the ALB target group should also use /api/health

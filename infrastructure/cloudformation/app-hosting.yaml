@@ -1,0 +1,688 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  TechNova Cloud WMS - application hosting. Runs the API and the web app as ECS
+  Fargate services behind one Application Load Balancer (/api/* -> API, everything
+  else -> web). Builds on the foundation stack (starter.yaml) through its exports.
+  Deploy with scripts/deploy-app.ps1, which also builds and pushes the images.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: technova-wms
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  FoundationStackName:
+    Type: String
+    Default: ''
+    Description: Name of the foundation stack. Empty = <ProjectName>-<Environment>.
+
+  ImageTag:
+    Type: String
+    Default: ''
+    Description: >
+      Image tag to run (scripts/deploy-app.ps1 passes the git commit). Empty creates
+      only the registries and load balancer, so the images can be pushed first.
+
+  ApiDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+
+  ApiMaxCount:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+    Description: Upper bound for CPU-based auto scaling of the API.
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ACM certificate for HTTPS. Without it the load balancer serves HTTP only (dev).
+
+  AdminEmail:
+    Type: String
+    Default: admin@technova.local
+    Description: First admin account, created on first start of an empty database.
+
+  EmulatorEndpoint:
+    Type: String
+    Default: ''
+    Description: >
+      LOCAL TESTING ONLY - leave empty on AWS. The Floci emulator does not provide task-role
+      credentials or RDS certificates, so when set the API gets this endpoint plus test
+      credentials and skips database TLS verification.
+
+  Owner:
+    Type: String
+    Default: platform-team
+
+  CostCenter:
+    Type: String
+    Default: CC-1001
+
+Rules:
+  PrimaryRegionOnly:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: The application runs in the primary region (us-east-1), where the database lives.
+
+Mappings:
+  EnvironmentConfig:
+    dev:
+      PublicSubnetACidr: 10.20.101.0/24
+      PublicSubnetBCidr: 10.20.102.0/24
+      LogRetentionDays: 14
+    staging:
+      PublicSubnetACidr: 10.30.101.0/24
+      PublicSubnetBCidr: 10.30.102.0/24
+      LogRetentionDays: 30
+    prod:
+      PublicSubnetACidr: 10.40.101.0/24
+      PublicSubnetBCidr: 10.40.102.0/24
+      LogRetentionDays: 90
+
+Conditions:
+  DefaultFoundation: !Equals [!Ref FoundationStackName, '']
+  HasImages: !Not [!Equals [!Ref ImageTag, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  # Production: tasks in private subnets behind a NAT gateway (~32 USD/month).
+  # dev/staging: tasks in public subnets with a public IP to avoid the NAT cost;
+  # their security groups still only accept traffic from the load balancer.
+  IsEmulator: !Not [!Equals [!Ref EmulatorEndpoint, '']]
+  PrivateTasks: !Equals [!Ref Environment, prod]
+  PublicTasks: !Not [!Condition PrivateTasks]
+
+Resources:
+
+  # ---- Public network: internet gateway, public subnets for the load balancer ----
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-igw' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      CidrBlock: !FindInMap [EnvironmentConfig, !Ref Environment, PublicSubnetACidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-a' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      CidrBlock: !FindInMap [EnvironmentConfig, !Ref Environment, PublicSubnetBCidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-b' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-rt' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---- Private egress (prod): NAT gateway so private tasks can reach ECR/Secrets Manager ----
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: PrivateTasks
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: PrivateTasks
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-nat' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: PrivateTasks
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-rt' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: PrivateTasks
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: PrivateTasks
+    Properties:
+      SubnetId: !ImportValue
+        Fn::Sub: ['${S}-PrivateSubnetAId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: PrivateTasks
+    Properties:
+      SubnetId: !ImportValue
+        Fn::Sub: ['${S}-PrivateSubnetBId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Free gateway endpoint: S3 traffic (product images, ECR layers) skips the NAT
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: PrivateTasks
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # ---- Security groups: internet -> ALB -> tasks (-> database via foundation SG) ----
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudWMS load balancer - HTTP/HTTPS from the internet
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-alb-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # The API tasks use the foundation's AppSecurityGroup (which the database trusts);
+  # allow the load balancer into it on the API port only.
+  ApiFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: ['${S}-AppSecurityGroupId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      Description: API from load balancer
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudWMS web app tasks - only from the load balancer
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: Web from load balancer
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-web-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---- Load balancer ----
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: PublicDefaultRoute
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}'
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+        - { Key: idle_timeout.timeout_seconds, Value: '60' }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        # Give in-flight requests time to finish on deploys (the API drains on SIGTERM)
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-web'
+      VpcId: !ImportValue
+        Fn::Sub: ['${S}-VpcId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+
+  # HTTP: serve the app when there is no certificate, otherwise redirect to HTTPS
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: !If
+        - HasCertificate
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+        - - Type: forward
+            TargetGroupArn: !Ref WebTargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  ApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ['/api/*'] }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # ---- Container registries ----
+  ApiRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/${Environment}/api'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 20 most recent images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  WebRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/${Environment}/web'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 20 most recent images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---- First-admin password: generated, readable in Secrets Manager, never in logs ----
+  AdminPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${Environment}/initial-admin-password'
+      Description: !Sub 'Password of ${AdminEmail}, used only when the database has no users yet. Change it after first sign-in.'
+      GenerateSecretString:
+        PasswordLength: 24
+        ExcludeCharacters: '"''\`$'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---- ECS ----
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}'
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: cloudformation }
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}/api'
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, LogRetentionDays]
+
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}/web'
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, LogRetentionDays]
+
+  # Used by ECS itself (not the app): pull images, write logs, inject the admin secret
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-execution-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PullImages
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: [!GetAtt ApiRepository.Arn, !GetAtt WebRepository.Arn]
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: [!GetAtt ApiLogGroup.Arn, !GetAtt WebLogGroup.Arn]
+              - Sid: InjectAdminPassword
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AdminPasswordSecret
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasImages
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-api'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      # The app's own permissions: its bucket, the DB secret and the JWT key only
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ['${S}-AppRuntimeRoleArn', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub '${ApiRepository.RepositoryUri}:${ImageTag}'
+          Essential: true
+          PortMappings: [{ ContainerPort: 3000, Protocol: tcp }]
+          StopTimeout: 30
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: PORT, Value: '3000' }
+            - { Name: AWS_REGION, Value: !Ref 'AWS::Region' }
+            - { Name: TRUST_PROXY, Value: 'true' }
+            - Name: CORS_ORIGINS
+              Value: !If [HasCertificate, !Sub 'https://${LoadBalancer.DNSName}', !Sub 'http://${LoadBalancer.DNSName}']
+            - Name: S3_BUCKET_NAME
+              Value: !ImportValue
+                Fn::Sub: ['${S}-AssetsBucketName', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+            - Name: DB_SECRET_ARN
+              Value: !ImportValue
+                Fn::Sub: ['${S}-DbSecretArn', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+            - Name: JWT_SECRET_ARN
+              Value: !ImportValue
+                Fn::Sub: ['${S}-JwtSecretArn', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+            - { Name: DB_SSL, Value: !If [IsEmulator, 'false', 'true'] }
+            - { Name: DB_SSL_CA_PATH, Value: /app/certs/rds-global-bundle.pem }
+            - !If [IsEmulator, { Name: AWS_ENDPOINT_URL, Value: !Ref EmulatorEndpoint }, !Ref 'AWS::NoValue']
+            - !If [IsEmulator, { Name: AWS_ACCESS_KEY_ID, Value: test }, !Ref 'AWS::NoValue']
+            - !If [IsEmulator, { Name: AWS_SECRET_ACCESS_KEY, Value: test }, !Ref 'AWS::NoValue']
+            - { Name: ADMIN_EMAIL, Value: !Ref AdminEmail }
+          Secrets:
+            - { Name: ADMIN_PASSWORD, ValueFrom: !Ref AdminPasswordSecret }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: api
+          ReadonlyRootFilesystem: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasImages
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-web'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub '${WebRepository.RepositoryUri}:${ImageTag}'
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: web
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ApiService:
+    Type: AWS::ECS::Service
+    Condition: HasImages
+    DependsOn: ApiRule
+    Properties:
+      ServiceName: api
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref ApiTaskDefinition
+      DesiredCount: !Ref ApiDesiredCount
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        # Roll back automatically if the new version never becomes healthy
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !If [PublicTasks, ENABLED, DISABLED]
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ['${S}-AppSecurityGroupId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+          Subnets: !If
+            - PublicTasks
+            - [!Ref PublicSubnetA, !Ref PublicSubnetB]
+            - - !ImportValue
+                Fn::Sub: ['${S}-PrivateSubnetAId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+              - !ImportValue
+                Fn::Sub: ['${S}-PrivateSubnetBId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      LoadBalancers:
+        - { ContainerName: api, ContainerPort: 3000, TargetGroupArn: !Ref ApiTargetGroup }
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  WebService:
+    Type: AWS::ECS::Service
+    Condition: HasImages
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: web
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref WebTaskDefinition
+      DesiredCount: !Ref ApiDesiredCount
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !If [PublicTasks, ENABLED, DISABLED]
+          SecurityGroups: [!Ref WebSecurityGroup]
+          Subnets: !If
+            - PublicTasks
+            - [!Ref PublicSubnetA, !Ref PublicSubnetB]
+            - - !ImportValue
+                Fn::Sub: ['${S}-PrivateSubnetAId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+              - !ImportValue
+                Fn::Sub: ['${S}-PrivateSubnetBId', { S: !If [DefaultFoundation, !Sub '${ProjectName}-${Environment}', !Ref FoundationStackName] }]
+      LoadBalancers:
+        - { ContainerName: web, ContainerPort: 8080, TargetGroupArn: !Ref WebTargetGroup }
+      PropagateTags: SERVICE
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---- API auto scaling on CPU ----
+  ApiScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: HasImages
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${ApiService.Name}'
+      MinCapacity: !Ref ApiDesiredCount
+      MaxCapacity: !Ref ApiMaxCount
+
+  ApiCpuScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: HasImages
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-api-cpu'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ApiScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        TargetValue: 60
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+Outputs:
+  AppUrl:
+    Description: Open the application here
+    Value: !If [HasCertificate, !Sub 'https://${LoadBalancer.DNSName}', !Sub 'http://${LoadBalancer.DNSName}']
+  ApiRepositoryUri:
+    Value: !GetAtt ApiRepository.RepositoryUri
+  WebRepositoryUri:
+    Value: !GetAtt WebRepository.RepositoryUri
+  ClusterName:
+    Value: !Ref Cluster
+  AdminPasswordSecretArn:
+    Description: Read the first admin's password here (Secrets Manager), then change it after signing in
+    Value: !Ref AdminPasswordSecret
+  RunningImageTag:
+    Value: !If [HasImages, !Ref ImageTag, 'none - push images and redeploy with ImageTag']
