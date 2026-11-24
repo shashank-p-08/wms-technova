@@ -113,7 +113,7 @@ jobs:
           python-version: '3.12'
       - run: pip install cfn-lint
       - run: cfn-lint infrastructure/cloudformation/*.yaml --regions us-east-1 us-west-2
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
       - name: terraform fmt / validate
         working-directory: infrastructure/terraform
         run: |
