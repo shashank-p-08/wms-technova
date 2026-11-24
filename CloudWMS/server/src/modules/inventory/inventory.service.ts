@@ -218,4 +218,28 @@ export class InventoryService {
       take: limit,
     });
   }
+
+  /** Export warehouse inventory list as CSV formatted string. */
+  async exportCsv(user: AuthUser, warehouseId: string): Promise<string> {
+    const overview = await this.getOverview(user, warehouseId);
+    const headers = [
+      'SKU',
+      'Product Name',
+      'Category',
+      'Quantity On Hand',
+      'Minimum Stock Level',
+      'Unit',
+      'Status',
+    ];
+    const rows = overview.map((item) => [
+      `"${item.sku.replace(/"/g, '""')}"`,
+      `"${item.name.replace(/"/g, '""')}"`,
+      `"${item.category.replace(/"/g, '""')}"`,
+      item.quantityOnHand,
+      item.minimumStockLevel,
+      `"${item.unitOfMeasurement.replace(/"/g, '""')}"`,
+      item.status,
+    ]);
+    return [headers.join(','), ...rows.map((r) => r.join(','))].join('\r\n');
+  }
 }

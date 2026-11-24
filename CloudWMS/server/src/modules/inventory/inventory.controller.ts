@@ -6,6 +6,7 @@ import {
   Query,
   HttpCode,
   HttpStatus,
+  Header,
   ParseUUIDPipe,
 } from '@nestjs/common';
 import { InventoryService } from './inventory.service';
@@ -32,6 +33,16 @@ export class InventoryController {
     @Query('warehouseId', new ParseUUIDPipe()) warehouseId: string,
   ) {
     return this.inventoryService.getOverview(user, warehouseId);
+  }
+
+  @Get('export')
+  @Header('Content-Type', 'text/csv')
+  @Header('Content-Disposition', 'attachment; filename="inventory-report.csv"')
+  exportCsv(
+    @CurrentUser() user: AuthUser,
+    @Query('warehouseId', new ParseUUIDPipe()) warehouseId: string,
+  ) {
+    return this.inventoryService.exportCsv(user, warehouseId);
   }
 
   @Get('low-stock')
