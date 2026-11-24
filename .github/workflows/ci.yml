@@ -21,7 +21,7 @@ jobs:
       run:
         working-directory: CloudWMS/client
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -56,7 +56,7 @@ jobs:
       DB_PASSWORD: ci-password
       DB_NAME: technova_wms
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -107,7 +107,7 @@ jobs:
     name: Infrastructure - lint & validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -129,6 +129,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [client, api]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -t cloudwms-api:ci CloudWMS/server
       - run: docker build -t cloudwms-web:ci --build-arg VITE_API_URL=/api CloudWMS/client
