@@ -2,7 +2,7 @@
 # CloudWMS API - production image (ECS Fargate / any container runtime)
 
 # ---- build: compile TypeScript with dev dependencies ----
-FROM node:24-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -11,13 +11,13 @@ COPY src ./src
 RUN npm run build
 
 # ---- deps: production dependencies only ----
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # ---- runtime ----
-FROM node:24-alpine
+FROM node:26-alpine
 ENV NODE_ENV=production \
     PORT=3000
 WORKDIR /app
