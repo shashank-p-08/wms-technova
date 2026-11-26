@@ -92,6 +92,38 @@ export class ProductsController {
     return this.productsService.present(await this.productsService.setImage(id, file), user);
   }
 
+  /** Pre-signed URL for direct client PUT upload to S3 */
+  @Post(':id/presigned-upload-url')
+  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  async getPresignedUploadUrl(
+    @Param('id') id: string,
+    @Body('contentType') contentType: string,
+  ) {
+    if (!contentType || !ALLOWED_IMAGE_TYPES.includes(contentType)) {
+      throw new BadRequestException(
+        `Invalid contentType. Allowed types: ${ALLOWED_IMAGE_TYPES.join(', ')}`,
+      );
+    }
+    return this.productsService.getPresignedUploadUrl(id, contentType);
+  }
+
+  /** Confirm that an image was uploaded directly to S3 via pre-signed URL */
+  @Post(':id/confirm-image')
+  @Roles(UserRole.ADMIN, UserRole.MANAGER)
+  async confirmImage(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body('key') key: string,
+  ) {
+    if (!key) {
+      throw new BadRequestException('Image key is required');
+    }
+    return this.productsService.present(
+      await this.productsService.confirmImageUpload(id, key),
+      user,
+    );
+  }
+
   @Delete(':id/image')
   @Roles(UserRole.ADMIN, UserRole.MANAGER)
   async removeImage(@CurrentUser() user: AuthUser, @Param('id') id: string) {
