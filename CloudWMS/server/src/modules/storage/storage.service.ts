@@ -7,6 +7,7 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -68,6 +69,25 @@ export class StorageService {
     return key;
   }
 
+  /** Short-lived pre-signed URL for direct browser/client upload (HTTP PUT). */
+  async getPresignedUploadUrl(
+    prefix: string,
+    contentType: string,
+    expiresInSeconds = 900,
+  ): Promise<{ uploadUrl: string; key: string }> {
+    const ext = EXTENSIONS[contentType] ?? 'bin';
+    const key = `${prefix}/${randomUUID()}.${ext}`;
+    const command = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      ContentType: contentType,
+    });
+    const uploadUrl = await getSignedUrl(this.s3, command, {
+      expiresIn: expiresInSeconds,
+    });
+    return { uploadUrl, key };
+  }
+
   /** Short-lived URL the browser can load directly; the bucket itself stays private. */
   async signedReadUrl(key: string, expiresInSeconds = 3600): Promise<string> {
     return getSignedUrl(
@@ -83,6 +103,15 @@ export class StorageService {
     } catch (err) {
       // An orphaned object is preferable to failing the user's request
       this.logger.warn(`Could not delete s3://${this.bucket}/${key}: ${(err as Error).message}`);
+    }
+  }
+
+  async exists(key: string): Promise<boolean> {
+    try {
+      await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      return true;
+    } catch {
+      return false;
     }
   }
 
