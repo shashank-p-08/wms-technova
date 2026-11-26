@@ -188,6 +188,37 @@ export class ProductsService {
     return product;
   }
 
+  async getPresignedUploadUrl(
+    id: string,
+    contentType: string,
+  ): Promise<{ uploadUrl: string; key: string }> {
+    if (!this.storage.enabled) {
+      throw new ServiceUnavailableException('Image storage is not configured (S3_BUCKET_NAME)');
+    }
+    const product = await this.findOne(id);
+    return this.storage.getPresignedUploadUrl(`products/${product.id}`, contentType);
+  }
+
+  async confirmImageUpload(id: string, key: string): Promise<Product> {
+    if (!this.storage.enabled) {
+      throw new ServiceUnavailableException('Image storage is not configured (S3_BUCKET_NAME)');
+    }
+    const product = await this.findOne(id);
+    const exists = await this.storage.exists(key);
+    if (!exists) {
+      throw new NotFoundException(`Object "${key}" was not found in S3 storage`);
+    }
+
+    const previousKey = product.imageKey;
+    product.imageKey = key;
+    await this.productRepo.save(product);
+
+    if (previousKey && previousKey !== key) {
+      await this.storage.delete(previousKey);
+    }
+    return product;
+  }
+
   /**
    * API representation for one user:
    *  - stock is summarised only over warehouses the user may see
